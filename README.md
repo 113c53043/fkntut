@@ -3,11 +3,12 @@ Official implementation of "Establishing Robust Generative Image Steganography v
 
 Paper Link: https://ieeexplore.ieee.org/abstract/document/10637346
 
+![Teaser Image](./sd.png "Teaser")
 ## Download Weights
 This repository is developed based on https://github.com/Stability-AI/stablediffusion/tree/main, and we have not modified the original model architectures and weights.
 
 The two models used in our paper:
-+ Stable Diffusion v1-5: 
++ Stable Diffusion v1-5: https://drive.google.com/file/d/1ISeumzN-JrhyAacOPlh1IjAv6MKffogU/view?usp=sharing
 + CLIP text encoder: https://huggingface.co/openai/clip-vit-large-patch14/tree/main
 
 ## Run Test Scripts
@@ -46,7 +47,7 @@ When the attack layer is mblur or gblur, the "factor" refers to the size of the 
 There are some dead codes, such as those related to image resolution, etc. If you intend to use a different generative model, please make sure to modify the relevant parts accordingly.
 
 ## Citation
-If you find our work useful, please cite the following item:
+If you find our work helpful, we would appreciate it if you could cite the following reference:
 ```latex
 @ARTICLE{huGRDH2024,
   author={Hu, Xiaoxiao and Li, Sheng and Ying, Qichao and Peng, Wanli and Zhang, Xinpeng and Qian, Zhenxing},
