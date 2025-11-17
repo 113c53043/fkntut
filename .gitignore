@@ -30,3 +30,5 @@ Thumbs.db        # Windows
 # 忽略模型權重資料夾
 weights/
 gpt2/
+outputs/
+
