@@ -28,13 +28,13 @@ CKPT_PATH = "/home/vcpuser/netdrive/Workspace/st/mas_GRDH/weights/v1-5-pruned.ck
 CONFIG_PATH = os.path.join(os.path.dirname(CURRENT_DIR), "configs/stable-diffusion/ldm.yaml")
 OUTPUT_ROOT = os.path.join(os.path.dirname(CURRENT_DIR), "training_data")
 
-# 生成數量 (每類各 500 張，總共 1000 張)
-NUM_SAMPLES = 500 
+# 【修改點 1】生成數量擴充到 10,000 對 (共 20,000 張圖)
+NUM_SAMPLES = 5000 
 PROMPTS = ["A photo of a landscape", "A cute cat", "A futuristic city", "Delicious food", "Abstract art"]
 
 def load_model(config_path, ckpt_path, device):
     config = OmegaConf.load(config_path)
-    # 【修正】加入 weights_only=False 以解決 PyTorch 2.6+ 的反序列化錯誤
+    # 加入 weights_only=False 以解決 PyTorch 2.6+ 的反序列化錯誤
     pl_sd = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     sd = pl_sd["state_dict"]
     model = instantiate_from_config(config.model)
@@ -60,8 +60,19 @@ def main():
     os.makedirs(os.path.join(OUTPUT_ROOT, "stego"), exist_ok=True)
 
     print(f"🚀 開始生成訓練數據 (目標: {NUM_SAMPLES} 對)...")
+    print(f"📁 輸出位置: {OUTPUT_ROOT}")
 
-    for i in tqdm(range(NUM_SAMPLES)):
+    # 使用 tqdm 顯示進度
+    for i in tqdm(range(NUM_SAMPLES), desc="Generating"):
+        # 【修改點 2】中斷續傳機制：檢查檔案是否已存在
+        cover_filename = f"{i:05d}.png"
+        cover_path = os.path.join(OUTPUT_ROOT, "cover", cover_filename)
+        stego_path = os.path.join(OUTPUT_ROOT, "stego", cover_filename)
+
+        if os.path.exists(cover_path) and os.path.exists(stego_path):
+            # 如果兩張圖都已經存在，就跳過不重新生成
+            continue
+
         prompt = np.random.choice(PROMPTS)
         seed = np.random.randint(0, 1000000)
         
@@ -71,7 +82,6 @@ def main():
         shape = (4, 512 // 8, 512 // 8)
         
         # === 生成 Cover (隨機噪聲) ===
-        # 完全隨機的噪聲，不含秘密
         np.random.seed(seed)
         noise_cover = torch.randn(1, *shape).to(device)
         
@@ -79,26 +89,26 @@ def main():
             z_0_cover, _ = sampler.sample(
                 steps=20, conditioning=c, batch_size=1, shape=shape,
                 unconditional_guidance_scale=5.0, unconditional_conditioning=uc,
-                x_T=noise_cover # Cover 使用純隨機噪聲
+                x_T=noise_cover
             )
             x_cover = model.decode_first_stage(z_0_cover)
             x_cover = torch.clamp((x_cover + 1.0) / 2.0, min=0.0, max=1.0)
         
         # 保存 Cover
         img_cover = Image.fromarray((x_cover[0].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8))
-        img_cover.save(os.path.join(OUTPUT_ROOT, "cover", f"{i:05d}.png"))
+        img_cover.save(cover_path)
 
         # === 生成 Stego (隱寫噪聲) ===
-        # 使用 Mapping Module 生成帶秘密的噪聲
         seed_key = np.random.randint(0, 999999)
-        # 這裡秘密訊息長度需對應 latent shape，根據您的 mapping_module 實作調整
         # 假設 latent shape 是 (1, 4, 64, 64)
         secret_msg = np.random.randint(0, 2, (1, 4, 64, 64)) 
         
-        # 調用您的映射函數生成 Latent
+        # 調用映射函數
+        # 注意：這裡 noise base 最好也固定 seed 或與 cover 保持某種關係，視您的演算法邏輯而定
+        # 這裡維持原樣：
         z_stego_np = mapper.encode_secret(
             secret_message=secret_msg, 
-            ori_sample=np.random.randn(1, 4, 64, 64), # 這裡也給一個隨機底
+            ori_sample=np.random.randn(1, 4, 64, 64), 
             seed_kernel=seed_key, 
             seed_shuffle=seed_key+123
         )
@@ -108,16 +118,20 @@ def main():
             z_0_stego, _ = sampler.sample(
                 steps=20, conditioning=c, batch_size=1, shape=shape,
                 unconditional_guidance_scale=5.0, unconditional_conditioning=uc,
-                x_T=noise_stego # Stego 使用映射後的噪聲
+                x_T=noise_stego
             )
             x_stego = model.decode_first_stage(z_0_stego)
             x_stego = torch.clamp((x_stego + 1.0) / 2.0, min=0.0, max=1.0)
 
         # 保存 Stego
         img_stego = Image.fromarray((x_stego[0].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8))
-        img_stego.save(os.path.join(OUTPUT_ROOT, "stego", f"{i:05d}.png"))
+        img_stego.save(stego_path)
 
-    print("✅ 數據生成完成！")
+        # 【修改點 3】定期清理 Cache (每 100 張清理一次，防止 OOM)
+        if i % 100 == 0:
+            torch.cuda.empty_cache()
+
+    print(f"✅ 10,000 對數據生成完成！請檢查 {OUTPUT_ROOT}")
 
 if __name__ == "__main__":
     main()

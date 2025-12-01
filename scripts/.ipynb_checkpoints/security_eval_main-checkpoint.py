@@ -3,41 +3,84 @@ import sys
 import torch
 import subprocess
 import numpy as np
-from collections import defaultdict
+from torchvision import transforms
+from PIL import Image
 
 # === 1. 路徑設定 ===
 CURRENT_DIR = os.path.abspath(os.path.dirname(__file__))
 PARENT_DIR = os.path.dirname(CURRENT_DIR)
 sys.path.append(PARENT_DIR)
+sys.path.append(os.path.join(PARENT_DIR, 'scripts')) # 確保能找到 models
 
-# === 2. 導入必要模組 ===
+# === 2. 導入模型定義 ===
 try:
     from text_stego_module.stego import TextStegoSystem
-    from scripts.xunet import XuNetEvaluator
-    print("✅ [System] 安全性測試模組導入成功")
+    from scripts.xunet_model import XuNet
+    from scripts.yenet_model import YeNet
+    from scripts.srnet_model import SRNet
+    from scripts.siastegnet_model import SiaStegNet
+    print("✅ [System] 所有安全性模型定義導入成功")
 except ImportError as e:
     print(f"❌ [System] 導入失敗: {e}")
     sys.exit(1)
 
-# === 3. 全域配置 (請確認這些路徑) ===
+# === 3. 全域配置 ===
 MAS_GRDH_PATH = PARENT_DIR
 CKPT_PATH = "/home/vcpuser/netdrive/Workspace/st/mas_GRDH/weights/v1-5-pruned.ckpt"
 GPT2_PATH = "/nfs/Workspace/st/mas_GRDH/gpt2"
 CONFIG_PATH = os.path.join(MAS_GRDH_PATH, "configs/stable-diffusion/ldm.yaml")
 PROMPT_FILE_LIST = os.path.join(MAS_GRDH_PATH, "text_prompt_dataset", "test_dataset.txt")
 ALICE_SCRIPT = os.path.join(MAS_GRDH_PATH, "scripts", "alice_gen.py")
-
-# 【重要】請設定您的 Xu-Net 權重路徑
-XUNET_CKPT_PATH = "/nfs/Workspace/stt/mas_GRDH/weights/xunet_best.pth" 
-
-# 輸出目錄 (建議與魯棒性測試分開)
 OUTPUT_DIR = os.path.join(MAS_GRDH_PATH, "outputs", "security_test_results")
 
-# === 4. Alice 生成函數 ===
+# === 權重設定 (請確保這些檔案存在，或由 train_universal.py 產生) ===
+WEIGHTS_DIR = os.path.join(MAS_GRDH_PATH, "weights")
+MODEL_PATHS = {
+    "XuNet": os.path.join(WEIGHTS_DIR, "xunet_best.pth"),
+    "YeNet": os.path.join(WEIGHTS_DIR, "yenet_best.pth"),
+    "SRNet": os.path.join(WEIGHTS_DIR, "srnet_best.pth"),
+    # "SiaStegNet": os.path.join(WEIGHTS_DIR, "siastegnet_best.pth") # 可選
+}
+
+# === 通用評估器類別 ===
+class UniversalEvaluator:
+    def __init__(self, model_name, model_class, ckpt_path):
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model = model_class().to(self.device)
+        self.model_name = model_name
+        
+        if os.path.exists(ckpt_path):
+            try:
+                self.model.load_state_dict(torch.load(ckpt_path, map_location=self.device))
+                print(f"✅ [{model_name}] 權重載入成功")
+            except Exception as e:
+                print(f"⚠️ [{model_name}] 權重載入錯誤 (架構不符?): {e}")
+        else:
+            print(f"⚠️ [{model_name}] 找不到權重檔 ({ckpt_path})，使用隨機權重。")
+            
+        self.model.eval()
+        self.transform = transforms.Compose([
+            transforms.Grayscale(num_output_channels=1),
+            transforms.Resize((256, 256)),
+            transforms.ToTensor(),
+        ])
+
+    def eval_image(self, img_path):
+        try:
+            image = Image.open(img_path).convert('RGB')
+            image = self.transform(image).unsqueeze(0).to(self.device)
+            with torch.no_grad():
+                outputs = self.model(image)
+                probabilities = torch.nn.functional.softmax(outputs, dim=1)
+                # 假設 index 1 是 Stego
+                stego_prob = probabilities[0][1].item()
+            return stego_prob
+        except Exception as e:
+            print(f"Eval Error: {e}")
+            return 0.5
+
+# === Alice 生成函數 (保持不變) ===
 def run_alice_only(text_sys, prompt, session_key, output_path):
-    """
-    僅執行 Alice 生成隱寫圖像，不進行後續攻擊測試
-    """
     try:
         stego_prompt_text, _ = text_sys.alice_encode(prompt, session_key)
     except Exception as e:
@@ -55,85 +98,71 @@ def run_alice_only(text_sys, prompt, session_key, output_path):
     ]
     
     try:
-        # 執行 Alice 腳本
         subprocess.run(cmd_alice, check=True, cwd=MAS_GRDH_PATH, capture_output=True, text=True, timeout=300)
         return output_path
-    except subprocess.CalledProcessError as e:
-        print(f"❌ Alice 生成失敗:\n{e.stderr}")
-        return None
-    except subprocess.TimeoutExpired:
-        print("❌ Alice 生成超時")
+    except Exception as e:
+        print(f"❌ 生成失敗: {e}")
         return None
 
-# === 5. 主程式 ===
+# === 主程式 ===
 def main():
-    print("🛡️ 安全性 (Security Analysis) 獨立測試腳本啟動 🛡️")
+    print("🛡️ 全方位安全性測試 (Security Analysis) 啟動 🛡️")
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    # --- 初始化 ---
+    # 1. 初始化 Prompt
     if not os.path.exists(PROMPT_FILE_LIST):
-        print(f"⚠️ 找不到 Prompt 文件，使用預設測試")
         prompts = ["A fast red car driving on the highway"]
     else:
         with open(PROMPT_FILE_LIST, 'r') as f:
             prompts = [line.strip() for line in f if line.strip()]
     
-    print(f"[System] 加載 {len(prompts)} 個 Prompts 進行測試")
+    # 2. 初始化所有評估器
+    evaluators = []
+    evaluators.append(UniversalEvaluator("XuNet", XuNet, MODEL_PATHS["XuNet"]))
+    evaluators.append(UniversalEvaluator("YeNet", YeNet, MODEL_PATHS["YeNet"]))
+    evaluators.append(UniversalEvaluator("SRNet", SRNet, MODEL_PATHS["SRNet"]))
     
-    # 初始化 TextStego 和 XuNet
     text_sys = TextStegoSystem(model_name=GPT2_PATH)
     
-    if os.path.exists(XUNET_CKPT_PATH):
-        security_evaluator = XuNetEvaluator(ckpt_path=XUNET_CKPT_PATH)
-    else:
-        print(f"⚠️ [Warning] 找不到權重檔 {XUNET_CKPT_PATH}，使用隨機初始化模型進行流程測試。")
-        security_evaluator = XuNetEvaluator(ckpt_path=None)
+    results_table = [] # 儲存結果以便最後顯示
 
-    scores = []
-    
-    print("\n" + "="*80)
-    print(f"{'ID'.ljust(5)} | {'Prompt Preview'.ljust(40)} | {'Xu-Net Score (Prob)'.ljust(20)} | {'Result'}")
-    print("-" * 80)
+    print("\n" + "="*100)
+    print(f"{'ID'.ljust(5)} | {'Prompt Preview'.ljust(30)} | {'XuNet'.ljust(8)} | {'YeNet'.ljust(8)} | {'SRNet'.ljust(8)} | {'Avg Score'.ljust(10)} | {'Verdict'}")
+    print("-" * 100)
 
-    # --- 測試循環 ---
+    total_avg_score = 0
+    valid_samples = 0
+
     for i, prompt in enumerate(prompts):
         prompt_id = f"{i+1:03d}"
         session_key = int(np.random.randint(10000000, 99999999))
-        
-        # 1. 生成圖片
         stego_img_path = os.path.join(OUTPUT_DIR, f"sec_test_{prompt_id}.png")
+        
         if not run_alice_only(text_sys, prompt, session_key, stego_img_path):
-            print(f"{prompt_id}   | 生成失敗".ljust(80))
             continue
-            
-        # 2. 安全性檢測 (Steganalysis)
-        stego_prob = security_evaluator.eval_image(stego_img_path)
-        scores.append(stego_prob)
-        
-        # 判斷結果 (一般而言 0.5 為閾值，越低越好)
-        result_str = "✅ Secure" if stego_prob < 0.5 else "⚠️ Detectable"
-        prompt_preview = (prompt[:37] + "...") if len(prompt) > 37 else prompt
-        
-        print(f"{prompt_id}   | {prompt_preview.ljust(40)} | {f'{stego_prob:.4f}'.ljust(20)} | {result_str}")
 
-    # --- 最終報告 ---
-    if scores:
+        # 多模型評估
+        scores = []
+        for evaluator in evaluators:
+            scores.append(evaluator.eval_image(stego_img_path))
+        
         avg_score = sum(scores) / len(scores)
-        print("="*80)
-        print(f"\n📊 安全性測試總結 (共 {len(scores)} 張圖片):")
-        print(f"   平均被偵測機率 (Avg. Stego Probability): {avg_score:.4f}")
-        print(f"   (理想目標：接近 0.0 或小於 0.5)")
+        total_avg_score += avg_score
+        valid_samples += 1
         
-        # 計算 Anti-Steganalysis Accuracy (欺騙率)
-        # 即被判定為 Cover (Prob < 0.5) 的比例
-        undetected_count = sum(1 for s in scores if s < 0.5)
-        detection_accuracy = (1 - (undetected_count / len(scores))) * 100
-        print(f"   Xu-Net 偵測成功率: {detection_accuracy:.2f}%")
-        print(f"   我方逃逸成功率 (Undetectability): {(undetected_count / len(scores)) * 100:.2f}%")
-    else:
-        print("❌ 沒有產生有效的測試結果。")
+        verdict = "✅ Pass" if avg_score < 0.5 else "⚠️ Fail"
+        prompt_prev = (prompt[:27] + "...") if len(prompt) > 27 else prompt
+        
+        # 格式化輸出
+        score_strs = [f"{s:.2f}" for s in scores]
+        print(f"{prompt_id}   | {prompt_prev.ljust(30)} | {score_strs[0].ljust(8)} | {score_strs[1].ljust(8)} | {score_strs[2].ljust(8)} | {f'{avg_score:.2f}'.ljust(10)} | {verdict}")
 
-    print("="*80)
+    print("="*100)
+    if valid_samples > 0:
+        print(f"📊 總體安全性總結 (共 {valid_samples} 張):")
+        print(f"   平均被偵測率 (所有模型平均): {total_avg_score / valid_samples:.4f}")
+    else:
+        print("無有效樣本。")
 
 if __name__ == "__main__":
     main()
