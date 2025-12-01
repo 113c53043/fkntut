@@ -104,9 +104,8 @@ def run_experiment(session_key):
     # === 關鍵修改 1: 使用紋理豐富的 Prompt (避免平滑霓虹燈) ===
     # 這種 Prompt 對隱寫術極度友好，幾乎看不出修改
     #prompt = "Close up texture of an old mossy stone wall with small white flowers, realistic, 8k, highly detailed"
+    prompt = "a cute kitten playing soccer, tiny cat kicking a football on a grassy field, dynamic action pose, bright sunlight, soft fur texture, detailed paws, energetic movement, cinematic lighting, shallow depth of field, ultra high resolution, 8k, highly detailed, photorealistic"
     #prompt = "a cute kitten playing soccer, tiny cat kicking a football on a grassy field, dynamic action pose, bright sunlight, soft fur texture, detailed paws, energetic movement, cinematic lighting, shallow depth of field, ultra high resolution, 4k, highly detailed, photorealistic"
-    prompt = "a cute kitten performing a bicycle kick in soccer, tiny cat in mid-air doing a stunning acrobatic kick, football flying, dynamic motion, on a grassy field, dramatic action pose, sunlight, detailed fur, energetic, photorealistic, ultra high resolution, 4k, cinematic lighting, highly detailed"
-
     #prompt = "A futuristic city with neon lights and a dark sky, 8k, highly detailed"
     #prompt = "A futuristic cyberpunk city with neon lights and rain, 8k, highly detailed"
 
