@@ -40,3 +40,7 @@ outputs/
 outputs/
 *.bin
 *.pt
+validation_data/
+validation_data2/
+scripts/outputs/
+training_data/
