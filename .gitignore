@@ -36,3 +36,7 @@ validation_data/
 validation_data2/
 scripts/outputs/
 scripts/openai_clip_vit_base_patch32/pytorch_model.bin
+outputs/
+outputs/
+*.bin
+*.pt
