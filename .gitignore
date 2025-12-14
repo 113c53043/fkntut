@@ -44,3 +44,5 @@ validation_data/
 validation_data2/
 scripts/outputs/
 training_data/
+*.swp
+.ipynb_checkpoints/
