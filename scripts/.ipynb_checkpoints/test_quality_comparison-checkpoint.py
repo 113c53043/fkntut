@@ -16,7 +16,6 @@ from tqdm import tqdm
 import json
 import random
 
-
 # === 1. 路徑設定 ===
 CURRENT_DIR = os.path.abspath(os.path.dirname(__file__))
 PARENT_DIR = os.path.dirname(CURRENT_DIR)
@@ -28,7 +27,7 @@ try:
     from ldm.util import instantiate_from_config
     from ldm.models.diffusion.dpm_solver import DPMSolverSampler
     from mapping_module import ours_mapping 
-    # 【關鍵加速】直接導入 Alice 生成函數，不再使用 subprocess
+    # 導入剛剛修正後的 Alice
     from pure_alice_uncertainty_fixed import generate_alice_image 
 except ImportError as e:
     print(f"❌ 無法導入模組: {e}")
@@ -39,12 +38,13 @@ try:
     from piq import brisque
     BRISQUE_AVAILABLE = True
 except ImportError:
+    print("⚠️ PIQ library not found. BRISQUE will be 0.00. (pip install piq)")
     BRISQUE_AVAILABLE = False
 
 ssl._create_default_https_context = ssl._create_unverified_context
 
 # === 配置 ===
-TOTAL_IMAGES = 50 
+TOTAL_IMAGES = 1000 
 
 MAS_GRDH_PATH = PARENT_DIR
 CKPT_PATH = "/home/vcpuser/netdrive/Workspace/stt/mas_GRDH/weights/v1-5-pruned.ckpt"
@@ -77,7 +77,12 @@ class QualityEvaluator:
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             img = cv2.resize(img, (512, 512))
             img = img / 255.0
-            if range_norm: img = img * 2.0 - 1.0
+            if range_norm: 
+                # LPIPS 需要 [-1, 1]
+                img = img * 2.0 - 1.0
+            else:
+                # BRISQUE 需要 [0, 1]
+                pass 
             img = np.transpose(img, (2, 0, 1))
             return torch.tensor(img, dtype=torch.float32).unsqueeze(0).to(self.device)
         except: return None
@@ -91,12 +96,21 @@ class QualityEvaluator:
 
     def calculate_brisque(self, path_target):
         if not BRISQUE_AVAILABLE: return 0.0
+        # BRISQUE 需要 [0, 1] 範圍
         t_tar = self.load_img_tensor(path_target, range_norm=False)
         if t_tar is None: return 0.0
+        
+        # === [關鍵修正 Step 4] Debug BRISQUE ===
         try:
             with torch.no_grad():
-                return brisque(t_tar, data_range=1.0, reduction='none').item()
-        except: return 0.0
+                # data_range=1.0 對應輸入 [0, 1]
+                score = brisque(t_tar, data_range=1.0, reduction='none')
+                return score.item()
+        except Exception as e:
+            # 這裡會打印錯誤，而不是默默返回 0.0
+            # 常見錯誤: 模型下載失敗 (URLError) 或 輸入維度錯誤
+            print(f"\n⚠️ BRISQUE Fail on {os.path.basename(path_target)}: {e}")
+            return 0.0
 
 def load_model():
     print(f"⏳ Loading SD Model (ONCE for all)...")
@@ -118,7 +132,7 @@ def load_model():
     model.eval()
     return model
 
-def load_coco_prompts(json_path, limit=50):
+def load_coco_prompts(json_path, limit=1000):
     if not os.path.exists(json_path):
         print("❌ Captions missing.")
         sys.exit(1)
@@ -194,7 +208,6 @@ def main():
     if not os.path.exists(payload_path):
         with open(payload_path, "wb") as f: f.write(os.urandom(2048))
         
-    # Pre-read payload for function calls
     with open(payload_path, "rb") as f: 
         raw_data = f.read()
         CAPACITY_BYTES = 16384 // 8 
@@ -206,14 +219,13 @@ def main():
 
     prompts = load_coco_prompts(PATH_CAPTIONS, limit=TOTAL_IMAGES)
 
-    # === 強制清除舊圖 ===
-    print("\n🧹 Cleaning up old Alice results...")
+    # === 強制清除舊圖 (因為我們改了演算法，必須重跑) ===
+    print("\n🧹 Cleaning up old Alice results (Pure & Unc)...")
     if os.path.exists(DIR_PURE): shutil.rmtree(DIR_PURE)
     if os.path.exists(DIR_UNC): shutil.rmtree(DIR_UNC)
     os.makedirs(DIR_PURE, exist_ok=True)
     os.makedirs(DIR_UNC, exist_ok=True)
 
-    # === 單一進程生成所有圖片 (極速模式) ===
     print("\n📦 Loading Model (ONCE for all)...")
     model = load_model()
     sampler = DPMSolverSampler(model)
@@ -229,7 +241,6 @@ def main():
         path_unc = os.path.join(DIR_UNC, f"{i:05d}.png")
         path_latent = os.path.join(DIR_LATENT, f"{i:05d}.pt")
         
-        # 1. Baseline & Mapped
         if not os.path.exists(path_cover):
             generate_cover_image(model, sampler, prompt, path_cover, seed=session_key)
         
@@ -237,7 +248,6 @@ def main():
             generate_mapped_baseline_and_latent(model, sampler, prompt, session_key, payload_data, path_mapped, path_latent)
 
         # 2. Pure (LR=0.25)
-        # 直接呼叫函數，不啟動新進程
         if not os.path.exists(path_pure):
             generate_alice_image(
                 model, sampler, prompt, session_key, payload_data, path_pure, 
@@ -245,7 +255,7 @@ def main():
                 opt_iters=10, lr=0.25, lambda_reg=0.0, use_uncertainty=False
             )
 
-        # 3. Unc (LR=0.05, Reg=1.5)
+        # 3. Unc (LR=0.05, Reg=1.5) -> [注意] 這裡代碼其實已經應用了 Soft Mask 和 LR Decay
         if not os.path.exists(path_unc):
             generate_alice_image(
                 model, sampler, prompt, session_key, payload_data, path_unc, 
@@ -255,7 +265,6 @@ def main():
 
     print("\n✅ Generation Complete! Starting Metrics Calculation...")
     
-    # 釋放模型
     del model
     del sampler
     torch.cuda.empty_cache()
@@ -279,7 +288,6 @@ def main():
         stats["LPIPS"]["Pure"].append(evaluator.calculate_lpips(path_mapped, path_pure))
         stats["LPIPS"]["Unc"].append(evaluator.calculate_lpips(path_mapped, path_unc))
 
-    # FID
     print("   Resizing Real Images...")
     resize_images(DIR_REAL_COCO, DIR_REAL_RESIZED, max_images=TOTAL_IMAGES)
     
@@ -292,10 +300,9 @@ def main():
     fid_pure = calc_fid(DIR_REAL_RESIZED, DIR_PURE)
     fid_unc = calc_fid(DIR_REAL_RESIZED, DIR_UNC)
 
-    # === Report ===
     print("\n" + "="*80)
     print("FINAL RESULT: Paper Reproduction (Metric: COCO Prompts)")
-    print("Optimization: Pure (LR=0.25) vs Ours (LR=0.05, Reg=1.5)")
+    print("Optimization: Pure (LR=0.25) vs Ours (LR=0.05, Reg=1.5, SoftMask+Decay)")
     print("-" * 80)
     
     print(f"FID (↓) | Quality vs Real COCO")

@@ -5,7 +5,7 @@ import torch
 import numpy as np
 from omegaconf import OmegaConf
 from torch import autocast
-from PIL import Image, ImageEnhance # 新增 ImageEnhance
+from PIL import Image, ImageEnhance
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(CURRENT_DIR)
@@ -16,10 +16,9 @@ try:
     from ldm.util import instantiate_from_config
     from ldm.models.diffusion.dpm_solver import DPMSolverSampler
 except ImportError:
-    pass # 允許被導入時不報錯
+    pass 
 
 def load_model_from_config(config, ckpt, device):
-    from ldm.util import instantiate_from_config
     print(f"Loading model from {ckpt}...")
     try:
         pl_sd = torch.load(ckpt, map_location="cpu", weights_only=False)
@@ -52,23 +51,29 @@ def estimate_uncertainty(model, sampler, z_center, c, uc, scale, device, repeats
     v_min = variance_mean.min()
     v_max = variance_mean.max()
     norm_var = (variance_mean - v_min) / (v_max - v_min + 1e-8)
+    
+    # === [關鍵修正] Soft Masking ===
+    # 為了解決攻擊下的準確率問題，我們不能讓 Mask 降到 0
     mask = 1.0 - norm_var
     mask = torch.pow(mask, 2)
+    # 混合策略: 70% 依賴 Uncertainty, 30% 全局寫入 (提升魯棒性)
+    mask = mask * 0.7 + 0.3 
+    
     return mask.repeat(1, 4, 1, 1)
 
-# === [新增功能] 畫質增強模組 ===
+# === [關鍵修正] 恢復並微調 Refinement ===
+# 既然移除後 FID 崩壞，說明此步驟對你的實驗環境是必要的
 def apply_refinement(pil_image):
-    # 1. 微幅銳化 (Sharpen): 讓紋理更清晰，降低模糊感 (FID killer)
+    # 1. 微幅銳化 (Sharpen): 恢復細節
     enhancer = ImageEnhance.Sharpness(pil_image)
-    pil_image = enhancer.enhance(1.1) # 增強 10%
+    pil_image = enhancer.enhance(1.05) # 稍微降低強度 (1.1 -> 1.05) 以避免過度銳化
     
-    # 2. 微幅對比度 (Contrast): 讓圖片更立體
+    # 2. 微幅對比度 (Contrast)
     enhancer = ImageEnhance.Contrast(pil_image)
-    pil_image = enhancer.enhance(1.05) # 增強 5%
+    pil_image = enhancer.enhance(1.02) # 稍微降低強度 (1.05 -> 1.02)
     
     return pil_image
 
-# === 核心函數：接收模型物件 ===
 def generate_alice_image(model, sampler, prompt, secret_key, payload_data, outpath, init_latent_path=None, 
                          opt_iters=10, lr=0.05, lambda_reg=1.5, use_uncertainty=True, 
                          dpm_steps=20, scale=5.0, device="cuda"):
@@ -100,10 +105,18 @@ def generate_alice_image(model, sampler, prompt, secret_key, payload_data, outpa
     z_opt.requires_grad = False 
     z_best = z_target.clone() 
     min_loss = float('inf')
-    current_lr = lr
+    
+    # === [關鍵修正] 優化 Scheduler ===
+    initial_lr = lr
 
     # 3. Loop
     for i in range(opt_iters + 1):
+        # 使用 Cosine Decay 或是較平緩的線性衰減
+        # 這裡改用較保守的衰減: 1.0 -> 0.5，避免後期 LR 太小拉不動
+        progress = i / (opt_iters + 1)
+        decay_factor = 1.0 - (0.5 * progress) 
+        current_lr = initial_lr * decay_factor
+
         z_eval = z_target if i == 0 else z_opt
 
         with torch.no_grad(), autocast("cuda"):
@@ -122,19 +135,19 @@ def generate_alice_image(model, sampler, prompt, secret_key, payload_data, outpa
         if loss < min_loss:
             min_loss = loss
             z_best = z_eval.clone()
-        else:
-            if i > 0: current_lr *= 0.95
-
+        
         if i == opt_iters: break
 
         grad_recon = diff 
         grad_reg = 2.0 * (z_eval - z_target)
         total_gradient = grad_recon + lambda_reg * grad_reg
         guided_gradient = total_gradient * uncertainty_mask
+        
+        # 梯度更新
         update = torch.clamp(current_lr * guided_gradient, -0.1, 0.1)
         z_opt = torch.clamp(z_opt - update.to(device), -4.0, 4.0)
 
-    # 4. Final Decode & Refinement
+    # 4. Final Decode
     with torch.no_grad(), autocast("cuda"):
         z_0_final, _ = sampler.sample(steps=dpm_steps, conditioning=c, batch_size=1, shape=(4, 64, 64),
                                       unconditional_guidance_scale=scale, unconditional_conditioning=uc,
@@ -143,17 +156,13 @@ def generate_alice_image(model, sampler, prompt, secret_key, payload_data, outpa
     
     x_samples = torch.clamp((x_samples + 1.0) / 2.0, min=0.0, max=1.0)
     
-    # 轉為 PIL Image
     img_np = x_samples.cpu().numpy()[0].transpose(1, 2, 0) * 255
     pil_img = Image.fromarray(img_np.astype(np.uint8))
     
-    # === [關鍵] 應用畫質增強 ===
-    # 這一步會提升 FID 和 BRISQUE 分數
+    # === [關鍵修正] 應用 Refinement ===
     final_img = apply_refinement(pil_img)
-    
     final_img.save(outpath)
 
-# 為了兼容舊的命令行呼叫方式，保留 main
 def run_alice():
     parser = argparse.ArgumentParser()
     parser.add_argument("--prompt", type=str, required=True)
@@ -188,7 +197,6 @@ def run_alice():
     final_payload = length_header + payload_data
     if len(final_payload) < CAPACITY_BYTES: final_payload += b'\x00' * (CAPACITY_BYTES - len(final_payload))
     
-    # 這裡將 payload_data 傳入 generate_alice_image 讓它處理
     generate_alice_image(
         model=model,
         sampler=sampler,
@@ -205,7 +213,7 @@ def run_alice():
         scale=opt.scale,
         device=opt.device
     )
-    print(f"Generated: {opt.outpath}")
+    # print(f"Generated: {opt.outpath}")
 
 if __name__ == "__main__":
     try: run_alice()

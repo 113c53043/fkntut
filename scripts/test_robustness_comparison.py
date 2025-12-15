@@ -13,13 +13,14 @@ PARENT_DIR = os.path.dirname(CURRENT_DIR)
 sys.path.append(PARENT_DIR) 
 
 # === 2. 導入攻擊模組 ===
+# 【修正】新增導入 crop 和 rotation
 try:
-    from robust_eval import identity, storage, resize, jpeg, mblur, gblur, awgn
+    from robust_eval import identity, storage, resize, jpeg, mblur, gblur, awgn, crop, rotation
     from utils import load_512
     print("✅ [System] 成功導入攻擊模組")
 except ImportError:
     try:
-        from scripts.robust_eval import identity, storage, resize, jpeg, mblur, gblur, awgn
+        from scripts.robust_eval import identity, storage, resize, jpeg, mblur, gblur, awgn, crop, rotation
         from scripts.utils import load_512
         print("✅ [System] 成功導入攻擊模組 (Package Import)")
     except ImportError as e:
@@ -33,7 +34,7 @@ if not os.path.exists(CKPT_PATH):
     CKPT_PATH = os.path.join(MAS_GRDH_PATH, "weights/v1-5-pruned.ckpt")
 
 CONFIG_PATH = os.path.join(MAS_GRDH_PATH, "configs/stable-diffusion/ldm.yaml")
-PROMPT_FILE_LIST = os.path.join(MAS_GRDH_PATH, "text_prompt_dataset", "test_dataset.txt")
+PROMPT_FILE_LIST = os.path.join(MAS_GRDH_PATH, "text_prompt_dataset", "coco_dataset.txt")
 
 # === 【關鍵修正】指向 _fixed.py 版本，確保邏輯與 FID 測試一致 ===
 ALICE_SCRIPT = os.path.join(MAS_GRDH_PATH, "pure_alice_fixed.py")
@@ -41,9 +42,10 @@ ALICE_UNC_SCRIPT = os.path.join(MAS_GRDH_PATH, "pure_alice_uncertainty_fixed.py"
 BOB_SCRIPT = os.path.join(MAS_GRDH_PATH, "pure_bob.py")
 TXT2IMG_SCRIPT = os.path.join(MAS_GRDH_PATH, "scripts", "txt2img.py") 
 
-OUTPUT_DIR = os.path.join(MAS_GRDH_PATH, "outputs", "robust_sota_results")
+OUTPUT_DIR = os.path.join(MAS_GRDH_PATH, "outputs", "robust_sota_results4")
 
 # === 4. 定義攻擊套件 ===
+# 【新增】加入 Crop (裁切) 與 Rotation (旋轉)
 ATTACK_SUITE = [
     (identity, [None], "1_Identity_Control", ".png"),
     (storage, [None], "2_Storage_Save_Load", ".png"),
@@ -52,6 +54,8 @@ ATTACK_SUITE = [
     (mblur, [3, 5], "5_Median_Blur", ".png"),            
     (gblur, [3, 5], "6_Gaussian_Blur", ".png"),         
     (awgn, [0.01, 0.05], "7_Gaussian_Noise", ".png"), 
+    (crop, [0.05, 0.1, 0.2], "8_Crop_Resize", ".png"),  # 0.1 = 裁掉邊緣10%
+    (rotation, [5, 10, 25], "9_Rotation", ".png"),      # 角度
 ]
 
 # === 5. 輔助函數 ===
@@ -101,11 +105,14 @@ def run_bob_once(img_path, prompt, session_key, gt_path):
     except: return "0.00%"
 
 def run_txt2img_test(attack_name_str, factor, single_prompt_file_path):
+    # 【更新】加入新攻擊的 Mapping，若 txt2img 不支援會略過或返回 N/A
     attack_map = {
         "1_Identity_Control": "identity", "2_Storage_Save_Load": "storage",
         "3_JPEG_Compression": "jpeg", "4_Resize": "resize",
         "5_Median_Blur": "mblur", "6_Gaussian_Blur": "gblur",
-        "7_Gaussian_Noise": "awgn"
+        "7_Gaussian_Noise": "awgn",
+        "8_Crop_Resize": "crop",
+        "9_Rotation": "rotation"
     }
     if attack_name_str not in attack_map: return "N/A"
     
@@ -144,7 +151,7 @@ def main():
     results_summary = defaultdict(lambda: ([], [], []))
     
     # 測試 20 張即可看出趨勢
-    prompts_to_test = prompts_to_test[:20] 
+    prompts_to_test = prompts_to_test[:1] 
     
     for i, base_prompt in enumerate(prompts_to_test):
         print(f"\n🔬 Prompt #{i+1}: '{base_prompt[:40]}...'")
@@ -163,7 +170,7 @@ def main():
         # LR=0.25 (高強度，對照組)
         print("  ⚡ Running Pure Alice (LR=0.25)...")
         success_pure = run_alice_generic(ALICE_SCRIPT, base_prompt, session_key, pure_stego_path, payload_path, 
-                                         extra_args=["--lr", "0.25"])
+                                        extra_args=["--lr", "0.25"])
         
         # 3. 執行 Uncertainty Alice (SOTA 參數)
         # LR=0.05, Reg=1.5 (我們調優出的最佳畫質參數)

@@ -62,6 +62,58 @@ def resize(samples, factor, tmp_image_name='tmp'):
     return reload_samples
 
 
+def crop(samples, factor, tmp_image_name='tmp'):
+    """
+    幾何攻擊：中心裁切 (Center Crop)
+    factor: 裁切掉的比例 (例如 0.1 代表裁掉周圍 10%，保留中間 90%)
+    裁切後會 Resize 回原始大小，模擬使用者截圖後重新使用的情境。
+    """
+    samples = _store(samples, tmp_image_name=tmp_image_name)
+    height, width = samples.shape[:2]
+    
+    # 計算要保留的區域大小
+    crop_h = int(height * (1.0 - factor))
+    crop_w = int(width * (1.0 - factor))
+    
+    # 計算中心點起始座標
+    y_start = (height - crop_h) // 2
+    x_start = (width - crop_w) // 2
+    
+    # 執行裁切
+    cropped = samples[y_start:y_start+crop_h, x_start:x_start+crop_w]
+    
+    # 攻擊通常伴隨著 Resize 回原尺寸 (否則無法進入模型)
+    recover_samples = cv2.resize(cropped, (width, height), interpolation=cv2.INTER_LINEAR)
+    
+    # 保存以便 Bob 讀取
+    cv2.imwrite(f'{tmp_image_name}.png', cv2.cvtColor(recover_samples, cv2.COLOR_RGB2BGR))
+    
+    reload_samples = load_512(recover_samples)
+    return reload_samples
+
+
+def rotation(samples, factor, tmp_image_name='tmp'):
+    """
+    幾何攻擊：旋轉 (Rotation)
+    factor: 旋轉角度 (Degrees)
+    """
+    samples = _store(samples, tmp_image_name=tmp_image_name)
+    height, width = samples.shape[:2]
+    center = (width // 2, height // 2)
+    
+    # 取得旋轉矩陣
+    M = cv2.getRotationMatrix2D(center, factor, 1.0)
+    
+    # 執行旋轉 (邊界填充黑色或其他顏色，這裡使用黑色邊界)
+    rotated_samples = cv2.warpAffine(samples, M, (width, height))
+    
+    # 保存以便 Bob 讀取
+    cv2.imwrite(f'{tmp_image_name}.png', cv2.cvtColor(rotated_samples, cv2.COLOR_RGB2BGR))
+    
+    reload_samples = load_512(rotated_samples)
+    return reload_samples
+
+
 def jpeg(samples, factor, tmp_image_name='tmp'):
     samples = _store_jpeg(samples, int(factor), tmp_image_name=tmp_image_name)
     reload_samples = load_512(samples)
