@@ -2,11 +2,13 @@ import sys
 import os
 import argparse
 import torch
+import torch.fft
 import numpy as np
 from omegaconf import OmegaConf
 from torch import autocast
 from PIL import Image
 
+# === 路徑設定 ===
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(CURRENT_DIR)
 sys.path.append(os.path.join(CURRENT_DIR, "scripts"))
@@ -15,6 +17,8 @@ try:
     from mapping_module import ours_mapping
     from ldm.util import instantiate_from_config
     from ldm.models.diffusion.dpm_solver import DPMSolverSampler
+    # 導入同步模組
+    from synchronization import SyncModule 
 except ImportError:
     pass 
 
@@ -31,16 +35,53 @@ def load_model_from_config(config, ckpt, device):
     model.eval()
     return model
 
-def estimate_uncertainty(model, sampler, z_center, c, uc, scale, device, repeats=4, noise_std=0.05, mask_mode='inverted'):
+def get_adaptive_base_weight(z_latent):
+    """
+    [CVPR 核心] 計算 Latent 的頻譜特徵並動態映射到 Base Weight。
+    【校準最終版】基於 COCO 1000張 校準數據 (Mean=0.3298)
+    """
+    freq_domain = torch.fft.fftn(z_latent, dim=(-2, -1))
+    energy = torch.abs(freq_domain)
+    
+    h, w = energy.shape[-2:]
+    h_center, w_center = h // 2, w // 2
+    r_h, r_w = h // 4, w // 4 
+    
+    total_energy = torch.sum(energy)
+    energy_shifted = torch.fft.fftshift(energy, dim=(-2, -1))
+    low_freq_energy = torch.sum(energy_shifted[..., h_center-r_h:h_center+r_h, w_center-r_w:w_center+r_w])
+    
+    low_freq_ratio = low_freq_energy / (total_energy + 1e-8)
+    ratio_val = low_freq_ratio.item()
+    
+    # 動態映射邏輯 (Distilled & Dampened)
+    target_mean_ratio = 0.3298  
+    target_base_weight = 0.30   
+    sensitivity = 0.5           
+    
+    base_weight = target_base_weight + (ratio_val - target_mean_ratio) * sensitivity
+    base_weight = np.clip(base_weight, 0.25, 0.35) 
+    
+    # print(f"📊 [Spectrum] Ratio: {ratio_val:.4f} -> Base: {base_weight:.4f}")
+    return base_weight
+
+def estimate_uncertainty(model, sampler, z_center, c, uc, scale, device, repeats=4, noise_std=0.05, use_adaptive=True):
     z_recs = []
     fast_steps = 10 
+    z_clean_for_analysis = None
+    
     with torch.no_grad(), autocast("cuda"):
         for i in range(repeats):
             noise = torch.randn_like(z_center) * noise_std
             z_input = z_center + noise
+            
             z_0, _ = sampler.sample(steps=fast_steps, conditioning=c, batch_size=1, shape=(4, 64, 64),
                                     unconditional_guidance_scale=scale, unconditional_conditioning=uc,
                                     x_T=z_input, DPMencode=False, DPMdecode=True, verbose=False)
+            
+            if i == 0:
+                z_clean_for_analysis = z_0.clone()
+
             z_rec, _ = sampler.sample(steps=fast_steps, conditioning=c, batch_size=1, shape=(4, 64, 64),
                                       unconditional_guidance_scale=scale, unconditional_conditioning=uc,
                                       x_T=z_0, DPMencode=True, DPMdecode=False, verbose=False)
@@ -51,34 +92,23 @@ def estimate_uncertainty(model, sampler, z_center, c, uc, scale, device, repeats
     variance_mean = torch.mean(variance, dim=1, keepdim=True) 
     v_min = variance_mean.min()
     v_max = variance_mean.max()
-    
-    # 歸一化方差 (0~1)
-    # 1.0 = 高方差 (紋理區/邊緣)
-    # 0.0 = 低方差 (平滑區/天空)
     norm_var = (variance_mean - v_min) / (v_max - v_min + 1e-8)
     
-    # === [關鍵實驗] 邏輯切換 ===
-    if mask_mode == 'inverted':
-        # [模式 A: 反向/現狀] 強攻平滑區
-        # 邏輯: 1.0 - norm_var -> 平滑區權重變 1.0
-        # 優點: 抗 JPEG (因 JPEG 保留低頻)
-        # 缺點: 傷 FID (平滑區加噪明顯)
-        mask = 1.0 - norm_var
-    else:
-        # [模式 B: 正向/標準] 強攻紋理區
-        # 邏輯: norm_var -> 紋理區權重變 1.0
-        # 優點: 保 FID (人眼看不見紋理區的噪聲)
-        # 缺點: 怕 JPEG (高頻易被殺)
-        mask = norm_var
-        
+    mask = 1.0 - norm_var
     mask = torch.pow(mask, 2)
-    mask = mask * 0.7 + 0.3 # 保持相同的混合比例
+    
+    if use_adaptive:
+        base_weight = get_adaptive_base_weight(z_clean_for_analysis)
+    else:
+        base_weight = 0.3
+    
+    mask = mask * (1.0 - base_weight) + base_weight
     
     return mask.repeat(1, 4, 1, 1)
 
 def generate_alice_image(model, sampler, prompt, secret_key, payload_data, outpath, init_latent_path=None, 
                          opt_iters=10, lr=0.05, lambda_reg=1.5, use_uncertainty=True, 
-                         dpm_steps=20, scale=5.0, device="cuda", mask_mode='inverted'):
+                         dpm_steps=20, scale=5.0, device="cuda", use_adaptive=True):
     
     # 1. Prepare Latent
     if init_latent_path and os.path.exists(init_latent_path):
@@ -98,8 +128,7 @@ def generate_alice_image(model, sampler, prompt, secret_key, payload_data, outpa
     uc = model.get_learned_conditioning([negative_prompt])
 
     if use_uncertainty:
-        # 傳入 mask_mode
-        uncertainty_mask = estimate_uncertainty(model, sampler, z_target, c, uc, scale, device, mask_mode=mask_mode)
+        uncertainty_mask = estimate_uncertainty(model, sampler, z_target, c, uc, scale, device, use_adaptive=use_adaptive)
     else:
         uncertainty_mask = torch.ones_like(z_target)
 
@@ -113,7 +142,7 @@ def generate_alice_image(model, sampler, prompt, secret_key, payload_data, outpa
     # 3. Loop
     for i in range(opt_iters + 1):
         progress = i / (opt_iters + 1)
-        decay_factor = 1.0 - (0.5 * progress) 
+        decay_factor = 1.0 - (0.8 * progress) 
         current_lr = initial_lr * decay_factor
 
         z_eval = z_target if i == 0 else z_opt
@@ -154,6 +183,15 @@ def generate_alice_image(model, sampler, prompt, secret_key, payload_data, outpa
     
     x_samples = torch.clamp((x_samples + 1.0) / 2.0, min=0.0, max=1.0)
     
+    # === [新增] 添加幾何同步標記 ===
+    # 這一步在轉為 Numpy 之前執行，為圖片四角加上微小的同心圓
+    try:
+        sync_mod = SyncModule(shape=(512, 512))
+        x_samples = sync_mod.add_markers(x_samples)
+    except Exception as e:
+        print(f"Warning: Sync markers skipped due to error: {e}")
+    # =============================
+    
     img_np = x_samples.cpu().numpy()[0].transpose(1, 2, 0) * 255
     pil_img = Image.fromarray(img_np.astype(np.uint8))
     pil_img.save(outpath)
@@ -165,15 +203,13 @@ def run_alice():
     parser.add_argument("--payload_path", type=str, required=True)
     parser.add_argument("--outpath", type=str, default="output.png")
     parser.add_argument("--init_latent", type=str, default=None)
-    
     parser.add_argument("--opt_iters", type=int, default=10) 
     parser.add_argument("--lr", type=float, default=0.05) 
     parser.add_argument("--lambda_reg", type=float, default=1.5) 
     parser.add_argument("--use_uncertainty", action="store_true")
     
-    # 新增 Mask Logic 參數
-    parser.add_argument("--mask_mode", type=str, default="inverted", choices=["inverted", "standard"], 
-                        help="inverted (1-var, smooth focus) or standard (var, texture focus)")
+    parser.add_argument("--strategy", type=str, default="adaptive", choices=["adaptive", "fixed"], 
+                        help="Choose masking strategy")
 
     parser.add_argument("--dpm_steps", type=int, default=20)
     parser.add_argument("--scale", type=float, default=5.0)
@@ -197,7 +233,9 @@ def run_alice():
     
     # 存 GT
     np.save(opt.outpath + ".gt_bits.npy", np.frombuffer(final_payload, dtype=np.uint8))
-    
+
+    use_adaptive_flag = (opt.strategy == "adaptive")
+
     generate_alice_image(
         model=model,
         sampler=sampler,
@@ -213,7 +251,7 @@ def run_alice():
         dpm_steps=opt.dpm_steps,
         scale=opt.scale,
         device=opt.device,
-        mask_mode=opt.mask_mode # 傳入邏輯選擇
+        use_adaptive=use_adaptive_flag 
     )
 
 if __name__ == "__main__":
