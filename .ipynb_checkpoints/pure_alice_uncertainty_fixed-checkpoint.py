@@ -18,6 +18,9 @@ try:
 except ImportError:
     pass 
 
+# === 統一的 Negative Prompt ===
+LONG_NEGATIVE_PROMPT = "worst quality, low quality, lowres, bad anatomy, bad hands, text, error, missing fingers, extra digit, fewer digits, cropped, normal quality, jpeg artifacts, signature, watermark, username, blurry, bad feet, extra arms, extra legs, extra body, poorly drawn hands, missing arms, missing legs, extra hands, mangled fingers, extra fingers, disconnected limbs, mutated hands, long neck, duplicate, bad composition, malformed limbs, deformed, mutated, ugly, disgusting, amputation, cartoon, anime, 3d, illustration, talking, two bodies, double torso, three arms, three legs, bad framing, mutated face, deformed face, cross-eyed, body out of frame, cloned face, disfigured, fused fingers, too many fingers, long fingers, gross proportions, poorly drawn face, text focus, bad focus, out of focus, extra nipples, missing nipples, fused nipples, extra breasts, enlarged breasts, deformed breasts, bad shadow, overexposed, underexposed, bad lighting, color distortion, weird colors, dull colors, bad eyes, dead eyes, asymmetrical eyes, hollow eyes, collapsed eyes, mutated eyes, distorted iris, wrong eye position, wrong teeth, crooked teeth, melted teeth, distorted mouth, wrong lips, mutated lips, broken lips, twisted mouth, bad hair, coarse hair, messy hair, artifact hair, unnatural hair texture, missing hair, polygon hair, bad skin, oily skin, plastic skin, uneven skin, dirty skin, pores, face holes, oversharpen, overprocessed, nsfw, extra tongue, long tongue, split tongue, bad tongue, distorted tongue, blurry background, messy background, multiple heads, split head, fused head, broken head, missing head, duplicated head, wrong head, loli, child, kid, underage, boy, girl, infant, toddler, baby, baby face, young child, teen, 3D render, extra limb, twisted limb, broken limb, warped limb, oversized limb, undersized limb, smudge, glitch, errors, canvas frame, cropped head, cropped face, cropped body, depth-of-field error, weird depth, lens distortion, chromatic aberration, duplicate face, wrong face, face mismatch, hands behind back, incorrect fingers, extra joint, broken joint, doll-like, mannequin, porcelain skin, waxy skin, clay texture, incorrect grip, wrong pose, unnatural pose, floating object, floating limbs, floating head, missing shadow, unnatural shadow, dislocated shoulder, bad cloth, cloth error, clothing glitch, unnatural clothing folds, stretched fabric, corrupted texture, mosaic, censored, body distortion, bent spine, malformed spine, unnatural spine angle, twisted waist, extra waist, glowing eyes, horror eyes, scary face, mutilated, blood, gore, wounds, injury, amputee, long body, short body, bad perspective, impossible perspective, broken perspective, wrong angle, disfigured eyes, lazy eye, cyclops, extra eye, mutated body, malformed body, clay skin, huge head, tiny head, uneven head, incorrect anatomy, missing torso, half torso, torso distortion"
+
 def load_model_from_config(config, ckpt, device):
     print(f"Loading model from {ckpt}...")
     try:
@@ -31,7 +34,7 @@ def load_model_from_config(config, ckpt, device):
     model.eval()
     return model
 
-def estimate_uncertainty(model, sampler, z_center, c, uc, scale, device, repeats=4, noise_std=0.05):
+def estimate_uncertainty(model, sampler, z_center, c, uc, scale, device, repeats=4, noise_std=0.05, adaptive_mode=True):
     z_recs = []
     fast_steps = 10 
     with torch.no_grad(), autocast("cuda"):
@@ -45,44 +48,69 @@ def estimate_uncertainty(model, sampler, z_center, c, uc, scale, device, repeats
                                       unconditional_guidance_scale=scale, unconditional_conditioning=uc,
                                       x_T=z_0, DPMencode=True, DPMdecode=False, verbose=False)
             z_recs.append(z_rec)
+    
     stack = torch.stack(z_recs)
     variance = torch.var(stack, dim=0)
     variance_mean = torch.mean(variance, dim=1, keepdim=True) 
-    v_min = variance_mean.min()
-    v_max = variance_mean.max()
-    norm_var = (variance_mean - v_min) / (v_max - v_min + 1e-8)
     
-    # === [關鍵修正] Soft Masking ===
-    # 為了解決攻擊下的準確率問題，我們不能讓 Mask 降到 0
-    mask = 1.0 - norm_var
-    mask = torch.pow(mask, 2)
-    # 混合策略: 70% 依賴 Uncertainty, 30% 全局寫入 (提升魯棒性)
-    mask = mask * 0.7 + 0.3 
-    
+    if not adaptive_mode:
+        # === 舊邏輯 (Fixed) ===
+        # 實際上寫入強度極高 (~0.99)
+        v_min = variance_mean.min()
+        v_max = variance_mean.max()
+        norm_var = (variance_mean - v_min) / (v_max - v_min + 1e-8)
+        mask = 1.0 - norm_var
+        mask = torch.pow(mask, 2)
+        mask = mask * 0.7 + 0.3 
+        
+    else:
+        # === 超激進自適應 (Hyper-Aggressive Adaptive) ===
+        
+        # 1. 擴展 Quantile 範圍 (0.01 - 0.99)
+        # 讓更多像素參與正規化，使分佈更平滑，有助於 FID
+        v_min = torch.quantile(variance_mean, 0.01) 
+        v_max = torch.quantile(variance_mean, 0.99)
+        denom = v_max - v_min
+        if denom < 1e-8: denom = 1.0
+        
+        norm_var = (variance_mean - v_min) / denom
+        norm_var = torch.clamp(norm_var, 0.0, 1.0)
+
+        # 2. 8次方衰減 (Power of 8)
+        # 這會讓 mask 在 80% 的區域都非常接近 1.0
+        # 模仿 Fixed 的均勻性 (改善 FID)，同時保留對LPIPS的保護
+        norm_var_powered = torch.pow(norm_var, 8.0) 
+        mask = 1.0 - norm_var_powered
+        
+        # 3. 大幅提升地板值 (Base Floor -> 0.5)
+        # 我們必須接受：要贏過 Fixed 的 Robustness，能量必須夠強。
+        # 0.5 是絕對底線，加上動態調整，平均強度會落在 0.6~0.8 之間。
+        avg_uncertainty = torch.mean(norm_var).item()
+        
+        # 公式: 0.5 (Base) + 0.3 * Avg
+        # 範圍: [0.5, 0.8]
+        adaptive_floor = 0.5 + (0.3 * avg_uncertainty)
+        adaptive_floor = min(max(adaptive_floor, 0.5), 0.8)
+
+        # 應用 Floor
+        mask = mask * (1.0 - adaptive_floor) + adaptive_floor
+
     return mask.repeat(1, 4, 1, 1)
 
-# === [關鍵修正] 恢復並微調 Refinement ===
-# 既然移除後 FID 崩壞，說明此步驟對你的實驗環境是必要的
 def apply_refinement(pil_image):
-    # 1. 微幅銳化 (Sharpen): 恢復細節
     enhancer = ImageEnhance.Sharpness(pil_image)
-    pil_image = enhancer.enhance(1.05) # 稍微降低強度 (1.1 -> 1.05) 以避免過度銳化
-    
-    # 2. 微幅對比度 (Contrast)
+    pil_image = enhancer.enhance(1.05) 
     enhancer = ImageEnhance.Contrast(pil_image)
-    pil_image = enhancer.enhance(1.02) # 稍微降低強度 (1.05 -> 1.02)
-    
+    pil_image = enhancer.enhance(1.02) 
     return pil_image
 
 def generate_alice_image(model, sampler, prompt, secret_key, payload_data, outpath, init_latent_path=None, 
                          opt_iters=10, lr=0.05, lambda_reg=1.5, use_uncertainty=True, 
-                         dpm_steps=20, scale=5.0, device="cuda"):
+                         dpm_steps=20, scale=5.0, device="cuda", adaptive_mask=True):
     
-    # 1. Prepare Latent
     if init_latent_path and os.path.exists(init_latent_path):
         z_target = torch.load(init_latent_path, map_location=device)
     else:
-        # Fallback generation
         CAPACITY_BYTES = 16384 // 8 
         bits = np.unpackbits(np.frombuffer(payload_data, dtype=np.uint8))
         if len(bits) < 16384: bits = np.pad(bits, (0, 16384 - len(bits)), 'constant')
@@ -91,13 +119,12 @@ def generate_alice_image(model, sampler, prompt, secret_key, payload_data, outpa
         z_target_numpy = mapper.encode_secret(secret_message=bits, seed_kernel=secret_key, seed_shuffle=secret_key + 999)
         z_target = torch.from_numpy(z_target_numpy).float().to(device)
 
-    # 2. Setup Optimization
-    negative_prompt = "longbody, lowres, bad anatomy, bad hands, missing fingers, extra digit, fewer digits, cropped, worst quality, low quality"
     c = model.get_learned_conditioning([prompt])
-    uc = model.get_learned_conditioning([negative_prompt])
+    uc = model.get_learned_conditioning([LONG_NEGATIVE_PROMPT])
 
     if use_uncertainty:
-        uncertainty_mask = estimate_uncertainty(model, sampler, z_target, c, uc, scale, device)
+        uncertainty_mask = estimate_uncertainty(model, sampler, z_target, c, uc, scale, device, 
+                                                adaptive_mode=adaptive_mask)
     else:
         uncertainty_mask = torch.ones_like(z_target)
 
@@ -105,14 +132,9 @@ def generate_alice_image(model, sampler, prompt, secret_key, payload_data, outpa
     z_opt.requires_grad = False 
     z_best = z_target.clone() 
     min_loss = float('inf')
-    
-    # === [關鍵修正] 優化 Scheduler ===
     initial_lr = lr
 
-    # 3. Loop
     for i in range(opt_iters + 1):
-        # 使用 Cosine Decay 或是較平緩的線性衰減
-        # 這裡改用較保守的衰減: 1.0 -> 0.5，避免後期 LR 太小拉不動
         progress = i / (opt_iters + 1)
         decay_factor = 1.0 - (0.5 * progress) 
         current_lr = initial_lr * decay_factor
@@ -143,11 +165,9 @@ def generate_alice_image(model, sampler, prompt, secret_key, payload_data, outpa
         total_gradient = grad_recon + lambda_reg * grad_reg
         guided_gradient = total_gradient * uncertainty_mask
         
-        # 梯度更新
         update = torch.clamp(current_lr * guided_gradient, -0.1, 0.1)
         z_opt = torch.clamp(z_opt - update.to(device), -4.0, 4.0)
 
-    # 4. Final Decode
     with torch.no_grad(), autocast("cuda"):
         z_0_final, _ = sampler.sample(steps=dpm_steps, conditioning=c, batch_size=1, shape=(4, 64, 64),
                                       unconditional_guidance_scale=scale, unconditional_conditioning=uc,
@@ -158,8 +178,6 @@ def generate_alice_image(model, sampler, prompt, secret_key, payload_data, outpa
     
     img_np = x_samples.cpu().numpy()[0].transpose(1, 2, 0) * 255
     pil_img = Image.fromarray(img_np.astype(np.uint8))
-    
-    # === [關鍵修正] 應用 Refinement ===
     final_img = apply_refinement(pil_img)
     final_img.save(outpath)
 
@@ -175,6 +193,8 @@ def run_alice():
     parser.add_argument("--lr", type=float, default=0.05) 
     parser.add_argument("--lambda_reg", type=float, default=1.5) 
     parser.add_argument("--use_uncertainty", action="store_true")
+    
+    parser.add_argument("--adaptive_mask", action="store_true", help="Use adaptive floor and robust normalization")
     
     parser.add_argument("--dpm_steps", type=int, default=20)
     parser.add_argument("--scale", type=float, default=5.0)
@@ -211,9 +231,9 @@ def run_alice():
         use_uncertainty=opt.use_uncertainty,
         dpm_steps=opt.dpm_steps,
         scale=opt.scale,
-        device=opt.device
+        device=opt.device,
+        adaptive_mask=opt.adaptive_mask
     )
-    # print(f"Generated: {opt.outpath}")
 
 if __name__ == "__main__":
     try: run_alice()

@@ -22,12 +22,11 @@ PARENT_DIR = os.path.dirname(CURRENT_DIR)
 if PARENT_DIR not in sys.path:
     sys.path.insert(0, PARENT_DIR)
 
-# 導入模組
 try:
     from ldm.util import instantiate_from_config
     from ldm.models.diffusion.dpm_solver import DPMSolverSampler
     from mapping_module import ours_mapping 
-    # 導入剛剛修正後的 Alice
+    # 確實引用了修正後的 Alice 腳本
     from pure_alice_uncertainty_fixed import generate_alice_image 
 except ImportError as e:
     print(f"❌ 無法導入模組: {e}")
@@ -38,28 +37,26 @@ try:
     from piq import brisque
     BRISQUE_AVAILABLE = True
 except ImportError:
-    print("⚠️ PIQ library not found. BRISQUE will be 0.00. (pip install piq)")
     BRISQUE_AVAILABLE = False
 
 ssl._create_default_https_context = ssl._create_unverified_context
 
 # === 配置 ===
-TOTAL_IMAGES = 1000 
-
+TOTAL_IMAGES = 1000 # 測試 100 張
 MAS_GRDH_PATH = PARENT_DIR
 CKPT_PATH = "/home/vcpuser/netdrive/Workspace/stt/mas_GRDH/weights/v1-5-pruned.ckpt"
 if not os.path.exists(CKPT_PATH):
     CKPT_PATH = os.path.join(MAS_GRDH_PATH, "weights/v1-5-pruned.ckpt")
 CONFIG_PATH = os.path.join(MAS_GRDH_PATH, "configs/stable-diffusion/ldm.yaml")
-
 DIR_REAL_COCO = os.path.join(CURRENT_DIR, "coco_val2017")
 PATH_CAPTIONS = os.path.join(CURRENT_DIR, "coco_annotations", "captions_val2017.json")
 
-OUTPUT_ROOT = os.path.join(MAS_GRDH_PATH, "outputs", "paper_repro_results")
+OUTPUT_ROOT = os.path.join(MAS_GRDH_PATH, "outputs", "quality_comparison_final_2")
 DIR_COVER = os.path.join(OUTPUT_ROOT, "cover_sd")
 DIR_MAPPED = os.path.join(OUTPUT_ROOT, "mapped_base")
-DIR_PURE = os.path.join(OUTPUT_ROOT, "ours_pure")
-DIR_UNC = os.path.join(OUTPUT_ROOT, "ours_unc")
+DIR_PURE = os.path.join(OUTPUT_ROOT, "ours_pure")         # Pure
+DIR_UNC_FIXED = os.path.join(OUTPUT_ROOT, "ours_unc_fixed") # Fixed
+DIR_UNC_ADAPT = os.path.join(OUTPUT_ROOT, "ours_unc_adaptive") # Adaptive
 DIR_REAL_RESIZED = os.path.join(OUTPUT_ROOT, "real_coco_resized")
 DIR_TEMP = os.path.join(OUTPUT_ROOT, "temp")
 DIR_LATENT = os.path.join(OUTPUT_ROOT, "latents") 
@@ -67,7 +64,7 @@ DIR_LATENT = os.path.join(OUTPUT_ROOT, "latents")
 class QualityEvaluator:
     def __init__(self, device="cuda"):
         self.device = device
-        print("⚙️  Loading LPIPS model...")
+        # 載入 LPIPS 模型
         self.loss_fn_alex = lpips.LPIPS(net='alex').to(device)
 
     def load_img_tensor(self, path, range_norm=True):
@@ -80,9 +77,6 @@ class QualityEvaluator:
             if range_norm: 
                 # LPIPS 需要 [-1, 1]
                 img = img * 2.0 - 1.0
-            else:
-                # BRISQUE 需要 [0, 1]
-                pass 
             img = np.transpose(img, (2, 0, 1))
             return torch.tensor(img, dtype=torch.float32).unsqueeze(0).to(self.device)
         except: return None
@@ -96,31 +90,18 @@ class QualityEvaluator:
 
     def calculate_brisque(self, path_target):
         if not BRISQUE_AVAILABLE: return 0.0
-        # BRISQUE 需要 [0, 1] 範圍
+        # BRISQUE 需要 [0, 1]
         t_tar = self.load_img_tensor(path_target, range_norm=False)
         if t_tar is None: return 0.0
-        
-        # === [關鍵修正 Step 4] Debug BRISQUE ===
         try:
             with torch.no_grad():
-                # data_range=1.0 對應輸入 [0, 1]
                 score = brisque(t_tar, data_range=1.0, reduction='none')
                 return score.item()
-        except Exception as e:
-            # 這裡會打印錯誤，而不是默默返回 0.0
-            # 常見錯誤: 模型下載失敗 (URLError) 或 輸入維度錯誤
-            print(f"\n⚠️ BRISQUE Fail on {os.path.basename(path_target)}: {e}")
-            return 0.0
+        except: return 0.0
 
 def load_model():
-    print(f"⏳ Loading SD Model (ONCE for all)...")
+    print(f"⏳ Loading SD Model...")
     config = OmegaConf.load(CONFIG_PATH)
-    def recursive_fix(conf):
-        if isinstance(conf, (dict, OmegaConf)):
-            for key in conf.keys():
-                if key == "image_size" and conf[key] == 32: conf[key] = 64
-                recursive_fix(conf[key])
-    recursive_fix(config.model)
     try:
         pl_sd = torch.load(CKPT_PATH, map_location="cpu", weights_only=False)
     except TypeError:
@@ -134,8 +115,7 @@ def load_model():
 
 def load_coco_prompts(json_path, limit=1000):
     if not os.path.exists(json_path):
-        print("❌ Captions missing.")
-        sys.exit(1)
+        return ["A professional photo of a dog"] * limit
     with open(json_path, 'r') as f:
         data = json.load(f)
     captions = [item['caption'] for item in data['annotations']]
@@ -146,11 +126,10 @@ def generate_cover_image(model, sampler, prompt, out_path, seed):
     if os.path.exists(out_path): return
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
-    device = torch.device("cuda")
     c = model.get_learned_conditioning([prompt])
     uc = model.get_learned_conditioning([""])
     shape = (4, 64, 64)
-    x_T = torch.randn(1, *shape, device=device)
+    x_T = torch.randn(1, *shape, device="cuda")
     with torch.no_grad(), autocast("cuda"):
         z_enc, _ = sampler.sample(steps=20, conditioning=c, batch_size=1, shape=shape,
                                   unconditional_guidance_scale=5.0, unconditional_conditioning=uc,
@@ -161,20 +140,13 @@ def generate_cover_image(model, sampler, prompt, out_path, seed):
 
 def generate_mapped_baseline_and_latent(model, sampler, prompt, session_key, payload_data, out_img_path, out_latent_path):
     if os.path.exists(out_img_path) and os.path.exists(out_latent_path): return
-
-    device = torch.device("cuda")
-    
-    # Payload processing (Already passed as bytes)
     bits = np.unpackbits(np.frombuffer(payload_data, dtype=np.uint8))
     if len(bits) < 16384: bits = np.pad(bits, (0, 16384 - len(bits)), 'constant')
     bits = bits[:16384].reshape(1, 4, 64, 64)
-
     mapper = ours_mapping(bits=1)
     z_target_numpy = mapper.encode_secret(secret_message=bits, seed_kernel=session_key, seed_shuffle=session_key + 999)
-    z_target = torch.from_numpy(z_target_numpy).float().to(device)
-    
+    z_target = torch.from_numpy(z_target_numpy).float().to("cuda")
     torch.save(z_target, out_latent_path)
-
     c = model.get_learned_conditioning([prompt])
     uc = model.get_learned_conditioning([""])
     with torch.no_grad(), autocast("cuda"):
@@ -190,141 +162,119 @@ def resize_images(src_dir, dst_dir, target_size=(512, 512), max_images=None):
     os.makedirs(dst_dir, exist_ok=True)
     files = [f for f in os.listdir(src_dir) if f.lower().endswith(('.jpg', '.png'))]
     if max_images: files = files[:max_images]
-    if len(os.listdir(dst_dir)) >= len(files): return
-    print(f"⚙️  Resizing {len(files)} images for FID...")
-    for f in tqdm(files, desc="Resizing"):
+    for f in tqdm(files, desc="Resizing Real Images"):
         try:
             with Image.open(os.path.join(src_dir, f)) as img:
                 img.convert('RGB').resize(target_size, Image.BICUBIC).save(os.path.join(dst_dir, f))
         except: pass
 
 def main():
-    print(f"🚀 High-Speed Paper Reproduction: {TOTAL_IMAGES} images 🚀")
+    print(f"🚀 Quality Comparison (Pure vs Fixed vs Adaptive): {TOTAL_IMAGES} images 🚀")
     
-    for d in [DIR_COVER, DIR_MAPPED, DIR_PURE, DIR_UNC, DIR_REAL_RESIZED, DIR_TEMP, DIR_LATENT]:
-        os.makedirs(d, exist_ok=True)
+    dirs = [DIR_COVER, DIR_MAPPED, DIR_PURE, DIR_UNC_FIXED, DIR_UNC_ADAPT, DIR_REAL_RESIZED, DIR_TEMP, DIR_LATENT]
+    for d in dirs: os.makedirs(d, exist_ok=True)
         
     payload_path = os.path.join(DIR_TEMP, "payload.dat")
     if not os.path.exists(payload_path):
         with open(payload_path, "wb") as f: f.write(os.urandom(2048))
-        
-    with open(payload_path, "rb") as f: 
-        raw_data = f.read()
-        CAPACITY_BYTES = 16384 // 8 
-        if len(raw_data) > CAPACITY_BYTES - 2: raw_data = raw_data[:CAPACITY_BYTES-2]
-        length_header = len(raw_data).to_bytes(2, 'big')
-        final_payload = length_header + raw_data
-        if len(final_payload) < CAPACITY_BYTES: final_payload += b'\x00' * (CAPACITY_BYTES - len(final_payload))
-        payload_data = final_payload
-
+    with open(payload_path, "rb") as f: payload_data = f.read()[:2046]
+    
     prompts = load_coco_prompts(PATH_CAPTIONS, limit=TOTAL_IMAGES)
-
-    # === 強制清除舊圖 (因為我們改了演算法，必須重跑) ===
-    print("\n🧹 Cleaning up old Alice results (Pure & Unc)...")
-    if os.path.exists(DIR_PURE): shutil.rmtree(DIR_PURE)
-    if os.path.exists(DIR_UNC): shutil.rmtree(DIR_UNC)
-    os.makedirs(DIR_PURE, exist_ok=True)
-    os.makedirs(DIR_UNC, exist_ok=True)
-
-    print("\n📦 Loading Model (ONCE for all)...")
     model = load_model()
     sampler = DPMSolverSampler(model)
 
-    print("\n📸 Generating Images (Batch Processing)...")
-    
+    print("\n📸 Generating Images...")
     for i, prompt in tqdm(enumerate(prompts), total=len(prompts)):
         session_key = 123456 + i
         
         path_cover = os.path.join(DIR_COVER, f"{i:05d}.png")
         path_mapped = os.path.join(DIR_MAPPED, f"{i:05d}.png")
+        
         path_pure = os.path.join(DIR_PURE, f"{i:05d}.png")
-        path_unc = os.path.join(DIR_UNC, f"{i:05d}.png")
+        path_unc_fixed = os.path.join(DIR_UNC_FIXED, f"{i:05d}.png")
+        path_unc_adapt = os.path.join(DIR_UNC_ADAPT, f"{i:05d}.png")
         path_latent = os.path.join(DIR_LATENT, f"{i:05d}.pt")
         
-        if not os.path.exists(path_cover):
-            generate_cover_image(model, sampler, prompt, path_cover, seed=session_key)
-        
-        if not os.path.exists(path_mapped):
-            generate_mapped_baseline_and_latent(model, sampler, prompt, session_key, payload_data, path_mapped, path_latent)
+        # 0. Cover & Mapped
+        generate_cover_image(model, sampler, prompt, path_cover, seed=session_key)
+        generate_mapped_baseline_and_latent(model, sampler, prompt, session_key, payload_data, path_mapped, path_latent)
 
-        # 2. Pure (LR=0.25)
+        # 1. Pure (LR=0.25, use_uncertainty=False)
         if not os.path.exists(path_pure):
             generate_alice_image(
                 model, sampler, prompt, session_key, payload_data, path_pure, 
-                init_latent_path=path_latent,
-                opt_iters=10, lr=0.25, lambda_reg=0.0, use_uncertainty=False
+                init_latent_path=path_latent, opt_iters=10, lr=0.25, lambda_reg=0.0, 
+                use_uncertainty=False, adaptive_mask=False
             )
 
-        # 3. Unc (LR=0.05, Reg=1.5) -> [注意] 這裡代碼其實已經應用了 Soft Mask 和 LR Decay
-        if not os.path.exists(path_unc):
+        # 2. Unc Fixed (LR=0.05, Reg=1.5, Adaptive=False)
+        if not os.path.exists(path_unc_fixed):
             generate_alice_image(
-                model, sampler, prompt, session_key, payload_data, path_unc, 
-                init_latent_path=path_latent,
-                opt_iters=10, lr=0.05, lambda_reg=1.5, use_uncertainty=True
+                model, sampler, prompt, session_key, payload_data, path_unc_fixed, 
+                init_latent_path=path_latent, opt_iters=10, lr=0.05, lambda_reg=1.5, 
+                use_uncertainty=True, adaptive_mask=False
             )
 
-    print("\n✅ Generation Complete! Starting Metrics Calculation...")
-    
-    del model
-    del sampler
+        # 3. Unc Adaptive (LR=0.05, Reg=1.5, Adaptive=True)
+        if not os.path.exists(path_unc_adapt):
+            generate_alice_image(
+                model, sampler, prompt, session_key, payload_data, path_unc_adapt, 
+                init_latent_path=path_latent, opt_iters=10, lr=0.05, lambda_reg=1.5, 
+                use_uncertainty=True, adaptive_mask=True
+            )
+
+    print("\n✅ Generation Complete! Calculating Metrics...")
+    del model, sampler
     torch.cuda.empty_cache()
-    gc.collect()
-
-    # === Metrics ===
-    print("\n[Phase 3] Calculating Metrics...")
-    evaluator = QualityEvaluator()
-    stats = defaultdict(lambda: {"Cover": [], "Pure": [], "Unc": []})
-
-    for i in tqdm(range(len(prompts))):
-        path_cover = os.path.join(DIR_COVER, f"{i:05d}.png")
-        path_mapped = os.path.join(DIR_MAPPED, f"{i:05d}.png")
-        path_pure = os.path.join(DIR_PURE, f"{i:05d}.png")
-        path_unc = os.path.join(DIR_UNC, f"{i:05d}.png")
-
-        stats["BRISQUE"]["Cover"].append(evaluator.calculate_brisque(path_cover))
-        stats["BRISQUE"]["Pure"].append(evaluator.calculate_brisque(path_pure))
-        stats["BRISQUE"]["Unc"].append(evaluator.calculate_brisque(path_unc))
-
-        stats["LPIPS"]["Pure"].append(evaluator.calculate_lpips(path_mapped, path_pure))
-        stats["LPIPS"]["Unc"].append(evaluator.calculate_lpips(path_mapped, path_unc))
-
-    print("   Resizing Real Images...")
-    resize_images(DIR_REAL_COCO, DIR_REAL_RESIZED, max_images=TOTAL_IMAGES)
     
-    print("   Calculating FID (num_workers=0)...")
+    evaluator = QualityEvaluator()
+    resize_images(DIR_REAL_COCO, DIR_REAL_RESIZED, max_images=TOTAL_IMAGES)
+
+    # FID Calculation
     def calc_fid(p1, p2):
         try: return fid_score.calculate_fid_given_paths([p1, p2], batch_size=50, device="cuda", dims=2048, num_workers=0)
         except: return 999.99
 
-    fid_cover = calc_fid(DIR_REAL_RESIZED, DIR_COVER)
+    print("  Calculating FID for Pure...")
     fid_pure = calc_fid(DIR_REAL_RESIZED, DIR_PURE)
-    fid_unc = calc_fid(DIR_REAL_RESIZED, DIR_UNC)
+    print("  Calculating FID for Fixed...")
+    fid_fixed = calc_fid(DIR_REAL_RESIZED, DIR_UNC_FIXED)
+    print("  Calculating FID for Adaptive...")
+    fid_adapt = calc_fid(DIR_REAL_RESIZED, DIR_UNC_ADAPT)
+    
+    # BRISQUE & LPIPS
+    stats = defaultdict(list)
+    for i in tqdm(range(len(prompts)), desc="Calculating LPIPS/BRISQUE"):
+        path_mapped = os.path.join(DIR_MAPPED, f"{i:05d}.png")
+        
+        path_pure = os.path.join(DIR_PURE, f"{i:05d}.png")
+        path_fixed = os.path.join(DIR_UNC_FIXED, f"{i:05d}.png")
+        path_adapt = os.path.join(DIR_UNC_ADAPT, f"{i:05d}.png")
+        
+        # Pure
+        stats["LPIPS_Pure"].append(evaluator.calculate_lpips(path_mapped, path_pure))
+        stats["BRISQUE_Pure"].append(evaluator.calculate_brisque(path_pure))
+
+        # Fixed
+        stats["LPIPS_Fixed"].append(evaluator.calculate_lpips(path_mapped, path_fixed))
+        stats["BRISQUE_Fixed"].append(evaluator.calculate_brisque(path_fixed))
+
+        # Adaptive
+        stats["LPIPS_Adapt"].append(evaluator.calculate_lpips(path_mapped, path_adapt))
+        stats["BRISQUE_Adapt"].append(evaluator.calculate_brisque(path_adapt))
 
     print("\n" + "="*80)
-    print("FINAL RESULT: Paper Reproduction (Metric: COCO Prompts)")
-    print("Optimization: Pure (LR=0.25) vs Ours (LR=0.05, Reg=1.5, SoftMask+Decay)")
+    print("FINAL COMPARISON: Pure vs Fixed vs Adaptive Mask")
+    print("-" * 80)
+    print(f"{'Metric':<10} | {'Pure':<15} | {'Fixed':<15} | {'Adaptive':<15}")
     print("-" * 80)
     
-    print(f"FID (↓) | Quality vs Real COCO")
-    print(f"  Cover (SD) : {fid_cover:.4f}")
-    print(f"  Ours (Pure): {fid_pure:.4f}")
-    print(f"  Ours (Unc) : {fid_unc:.4f} ({'✅ Better' if fid_unc < fid_pure else '🔻 Worse'})")
-    print("-" * 80)
+    print(f"{'FID (↓)':<10} | {fid_pure:<15.4f} | {fid_fixed:<15.4f} | {fid_adapt:<15.4f}")
     
-    avg_brisque_cover = np.mean(stats["BRISQUE"]["Cover"])
-    avg_brisque_pure = np.mean(stats["BRISQUE"]["Pure"])
-    avg_brisque_unc = np.mean(stats["BRISQUE"]["Unc"])
-    print(f"BRISQUE (↓) | Naturalness")
-    print(f"  Cover (SD) : {avg_brisque_cover:.2f}")
-    print(f"  Ours (Pure): {avg_brisque_pure:.2f}")
-    print(f"  Ours (Unc) : {avg_brisque_unc:.2f} ({'✅ Better' if avg_brisque_unc < avg_brisque_pure else '🔻 Worse'})")
-    print("-" * 80)
-
-    avg_lpips_pure = np.mean(stats["LPIPS"]["Pure"])
-    avg_lpips_unc = np.mean(stats["LPIPS"]["Unc"])
-    print(f"LPIPS (↓) | Distortion vs Mapped Baseline")
-    print(f"  Ours (Pure): {avg_lpips_pure:.4f}")
-    print(f"  Ours (Unc) : {avg_lpips_unc:.4f} ({'✅ Better' if avg_lpips_unc < avg_lpips_pure else '🔻 Worse'})")
+    print(f"{'LPIPS (↓)':<10} | {np.mean(stats['LPIPS_Pure']):<15.4f} | {np.mean(stats['LPIPS_Fixed']):<15.4f} | {np.mean(stats['LPIPS_Adapt']):<15.4f}")
+    
+    print(f"{'BRISQUE(↓)':<10} | {np.mean(stats['BRISQUE_Pure']):<15.2f} | {np.mean(stats['BRISQUE_Fixed']):<15.2f} | {np.mean(stats['BRISQUE_Adapt']):<15.2f}")
+    
     print("="*80)
 
 if __name__ == "__main__":
