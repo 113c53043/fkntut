@@ -46,3 +46,11 @@ scripts/outputs/
 training_data/
 *.swp
 .ipynb_checkpoints/
+
+
+# third-party / large repos
+CRoSS/
+DiffStega/
+SRNET/
+diffusiondb/
+
